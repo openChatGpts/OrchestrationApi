@@ -1895,6 +1895,12 @@ public class AdminController : ControllerBase
 
     private string GetSerilogDbPath()
     {
+        var serilogDbPath = _configuration.GetValue<string>("Serilog:WriteTo:2:Args:sqliteDbPath");
+        if (!string.IsNullOrEmpty(serilogDbPath))
+        {
+            return serilogDbPath;
+        }
+
         var dbConfig = _configuration.GetValue<string>("OrchestrationApi:Database:ConnectionString");
         if (string.IsNullOrEmpty(dbConfig))
         {
@@ -1911,6 +1917,149 @@ public class AdminController : ControllerBase
         return "Data/orchestration_api.db";
     }
 
+    private string GetSerilogTableName()
+    {
+        var tableName = _configuration.GetValue<string>("Serilog:WriteTo:2:Args:tableName");
+        return string.IsNullOrEmpty(tableName) ? "Logs" : tableName;
+    }
+
+    private async Task<(bool IsHealthy, string Message)> CheckDatabaseIntegrityAsync(string dbPath)
+    {
+        try
+        {
+            if (!System.IO.File.Exists(dbPath))
+            {
+                return (false, "数据库文件不存在");
+            }
+
+            var tableName = GetSerilogTableName();
+            using var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;");
+            await connection.OpenAsync();
+
+            // 检查表是否存在
+            using (var tableCheckCmd = new System.Data.SQLite.SQLiteCommand(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=@TableName", connection))
+            {
+                tableCheckCmd.Parameters.AddWithValue("@TableName", tableName);
+                var tableExists = Convert.ToInt32(await tableCheckCmd.ExecuteScalarAsync()) > 0;
+                if (!tableExists)
+                {
+                    return (false, $"日志表 '{tableName}' 不存在。请检查Serilog配置中的tableName是否正确，或调用修复接口创建表。");
+                }
+            }
+
+            // 检查表完整性
+            using var cmd = new System.Data.SQLite.SQLiteCommand($"PRAGMA integrity_check('{tableName}')", connection);
+            var result = await cmd.ExecuteScalarAsync();
+            var resultStr = result?.ToString() ?? "";
+
+            if (resultStr.Equals("ok", StringComparison.OrdinalIgnoreCase))
+            {
+                return (true, "数据库完整性检查通过");
+            }
+            return (false, $"数据库完整性检查失败: {resultStr}");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"数据库检查异常: {ex.Message}");
+        }
+    }
+
+    private async Task<bool> RepairDatabaseAsync(string dbPath)
+    {
+        try
+        {
+            var tableName = GetSerilogTableName();
+            using var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;");
+            await connection.OpenAsync();
+
+            // 检查表是否存在，如果存在但损坏则尝试删除重建
+            using (var checkCmd = new System.Data.SQLite.SQLiteCommand(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=@TableName", connection))
+            {
+                checkCmd.Parameters.AddWithValue("@TableName", tableName);
+                var exists = Convert.ToInt32(await checkCmd.ExecuteScalarAsync()) > 0;
+                if (exists)
+                {
+                    // 尝试删除损坏的表
+                    using var dropCmd = new System.Data.SQLite.SQLiteCommand($"DROP TABLE IF EXISTS [{tableName}]", connection);
+                    await dropCmd.ExecuteNonQueryAsync();
+                    _logger.LogWarning("已删除损坏的日志表: {TableName}", tableName);
+                }
+            }
+
+            var createTableSql = $@"
+                CREATE TABLE IF NOT EXISTS [{tableName}] (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    Timestamp TEXT,
+                    Level TEXT,
+                    RenderedMessage TEXT,
+                    Exception TEXT,
+                    Properties TEXT
+                )";
+            using var cmd = new System.Data.SQLite.SQLiteCommand(createTableSql, connection);
+            await cmd.ExecuteNonQueryAsync();
+
+            using var indexCmd = new System.Data.SQLite.SQLiteCommand(
+                $"CREATE INDEX IF NOT EXISTS IX_{tableName}_Timestamp ON [{tableName}](Timestamp)", connection);
+            await indexCmd.ExecuteNonQueryAsync();
+
+            using var levelIndexCmd = new System.Data.SQLite.SQLiteCommand(
+                $"CREATE INDEX IF NOT EXISTS IX_{tableName}_Level ON [{tableName}](Level)", connection);
+            await levelIndexCmd.ExecuteNonQueryAsync();
+
+            _logger.LogInformation("已重建日志表: {TableName}", tableName);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "修复数据库失败");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 检查Serilog日志数据库健康状态
+    /// </summary>
+    [HttpGet("serilog/health")]
+    public async Task<IActionResult> CheckSerilogHealth()
+    {
+        var dbPath = GetSerilogDbPath();
+        var (isHealthy, message) = await CheckDatabaseIntegrityAsync(dbPath);
+
+        return Ok(new
+        {
+            isHealthy,
+            message,
+            databasePath = dbPath,
+            databaseExists = System.IO.File.Exists(dbPath),
+            databaseSize = System.IO.File.Exists(dbPath) ? new FileInfo(dbPath).Length : 0
+        });
+    }
+
+    /// <summary>
+    /// 修复Serilog日志数据库（会清空现有日志）
+    /// </summary>
+    [HttpPost("serilog/repair")]
+    public async Task<IActionResult> RepairSerilogDatabase()
+    {
+        var dbPath = GetSerilogDbPath();
+        var (isHealthy, _) = await CheckDatabaseIntegrityAsync(dbPath);
+
+        if (isHealthy)
+        {
+            return Ok(new { success = true, message = "数据库状态正常，无需修复" });
+        }
+
+        var repaired = await RepairDatabaseAsync(dbPath);
+        if (repaired)
+        {
+            return Ok(new { success = true, message = "数据库已修复并重建，损坏的数据库已备份" });
+        }
+
+        return StatusCode(500, new { success = false, message = "数据库修复失败" });
+    }
+
     /// <summary>
     /// 查询Serilog系统日志
     /// </summary>
@@ -1919,13 +2068,24 @@ public class AdminController : ControllerBase
     {
         try
         {
+            var dbPath = GetSerilogDbPath();
+            var (isHealthy, healthMessage) = await CheckDatabaseIntegrityAsync(dbPath);
+            if (!isHealthy)
+            {
+                return StatusCode(503, new { 
+                    error = "数据库损坏", 
+                    message = healthMessage,
+                    repairEndpoint = "/api/admin/serilog/repair",
+                    hint = "请调用修复接口重建数据库"
+                });
+            }
+
+            var tableName = GetSerilogTableName();
             var response = new LogQueryResponse
             {
                 Page = request.Page,
                 PageSize = request.PageSize
             };
-
-            var dbPath = GetSerilogDbPath();
             using var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;");
             await connection.OpenAsync();
 
@@ -1958,7 +2118,7 @@ public class AdminController : ControllerBase
 
             var whereClause = whereConditions.Count > 0 ? $"WHERE {string.Join(" AND ", whereConditions)}" : "";
 
-            var countSql = $"SELECT COUNT(*) FROM orch_logs {whereClause}";
+            var countSql = $"SELECT COUNT(*) FROM [{tableName}] {whereClause}";
             using (var countCmd = new System.Data.SQLite.SQLiteCommand(countSql, connection))
             {
                 foreach (var param in parameters)
@@ -1973,7 +2133,7 @@ public class AdminController : ControllerBase
             var offset = (request.Page - 1) * request.PageSize;
             var querySql = $@"
                 SELECT Id, Timestamp, Level, RenderedMessage, Exception, Properties
-                FROM orch_logs
+                FROM [{tableName}]
                 {whereClause}
                 ORDER BY Timestamp DESC
                 LIMIT @Limit OFFSET @Offset";
@@ -2019,18 +2179,29 @@ public class AdminController : ControllerBase
     public async Task<IActionResult> GetSerilogStatistics()
     {
         try {
-            var stats = new LogStatistics();
             var dbPath = GetSerilogDbPath();
-            
+            var (isHealthy, healthMessage) = await CheckDatabaseIntegrityAsync(dbPath);
+            if (!isHealthy)
+            {
+                return StatusCode(503, new { 
+                    error = "数据库损坏", 
+                    message = healthMessage,
+                    repairEndpoint = "/api/admin/serilog/repair",
+                    hint = "请调用修复接口重建数据库"
+                });
+            }
+
+            var tableName = GetSerilogTableName();
+            var stats = new LogStatistics();
             using var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;");
             await connection.OpenAsync();
 
-            using (var cmd = new System.Data.SQLite.SQLiteCommand("SELECT COUNT(*) FROM orch_logs", connection))
+            using (var cmd = new System.Data.SQLite.SQLiteCommand($"SELECT COUNT(*) FROM [{tableName}]", connection))
             {
                 stats.TotalLogs = Convert.ToInt32(await cmd.ExecuteScalarAsync());
             }
 
-            using (var cmd = new System.Data.SQLite.SQLiteCommand("SELECT Level, COUNT(*) FROM orch_logs GROUP BY Level", connection))
+            using (var cmd = new System.Data.SQLite.SQLiteCommand($"SELECT Level, COUNT(*) FROM [{tableName}] GROUP BY Level", connection))
             {
                 using var reader = await cmd.ExecuteReaderAsync();
                 while (await reader.ReadAsync())
@@ -2042,20 +2213,20 @@ public class AdminController : ControllerBase
             }
 
             var last24Hours = DateTime.Now.AddHours(-24).ToString("yyyy-MM-dd HH:mm:ss");
-            using (var cmd = new System.Data.SQLite.SQLiteCommand($"SELECT COUNT(*) FROM orch_logs WHERE Timestamp >= @Time", connection))
+            using (var cmd = new System.Data.SQLite.SQLiteCommand($"SELECT COUNT(*) FROM [{tableName}] WHERE Timestamp >= @Time", connection))
             {
                 cmd.Parameters.Add(new System.Data.SQLite.SQLiteParameter("@Time", last24Hours));
                 stats.Last24Hours = Convert.ToInt32(await cmd.ExecuteScalarAsync());
             }
 
             var lastHour = DateTime.Now.AddHours(-1).ToString("yyyy-MM-dd HH:mm:ss");
-            using (var cmd = new System.Data.SQLite.SQLiteCommand($"SELECT COUNT(*) FROM orch_logs WHERE Timestamp >= @Time", connection))
+            using (var cmd = new System.Data.SQLite.SQLiteCommand($"SELECT COUNT(*) FROM [{tableName}] WHERE Timestamp >= @Time", connection))
             {
                 cmd.Parameters.Add(new System.Data.SQLite.SQLiteParameter("@Time", lastHour));
                 stats.LastHour = Convert.ToInt32(await cmd.ExecuteScalarAsync());
             }
 
-            using (var cmd = new System.Data.SQLite.SQLiteCommand("SELECT MIN(Timestamp), MAX(Timestamp) FROM orch_logs", connection))
+            using (var cmd = new System.Data.SQLite.SQLiteCommand($"SELECT MIN(Timestamp), MAX(Timestamp) FROM [{tableName}]", connection))
             {
                 using var reader = await cmd.ExecuteReaderAsync();
                 if (await reader.ReadAsync())
@@ -2089,13 +2260,24 @@ public class AdminController : ControllerBase
     {
         try
         {
-            var levels = new List<string>();
             var dbPath = GetSerilogDbPath();
+            var (isHealthy, healthMessage) = await CheckDatabaseIntegrityAsync(dbPath);
+            if (!isHealthy)
+            {
+                return StatusCode(503, new { 
+                    error = "数据库损坏", 
+                    message = healthMessage,
+                    repairEndpoint = "/api/admin/serilog/repair",
+                    hint = "请调用修复接口重建数据库"
+                });
+            }
 
+            var tableName = GetSerilogTableName();
+            var levels = new List<string>();
             using var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;");
             await connection.OpenAsync();
 
-            using var cmd = new System.Data.SQLite.SQLiteCommand("SELECT DISTINCT Level FROM orch_logs ORDER BY Level", connection);
+            using var cmd = new System.Data.SQLite.SQLiteCommand($"SELECT DISTINCT Level FROM [{tableName}] ORDER BY Level", connection);
             using var reader = await cmd.ExecuteReaderAsync();
             while (await reader.ReadAsync())
             {
@@ -2128,10 +2310,11 @@ public class AdminController : ControllerBase
             }
 
             var dbPath = GetSerilogDbPath();
+            var tableName = GetSerilogTableName();
             using var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;");
             await connection.OpenAsync();
 
-            var deleteSql = "DELETE FROM orch_logs WHERE Timestamp < @Time";
+            var deleteSql = $"DELETE FROM [{tableName}] WHERE Timestamp < @Time";
             using var cmd = new System.Data.SQLite.SQLiteCommand(deleteSql, connection);
             cmd.Parameters.Add(new System.Data.SQLite.SQLiteParameter("@Time", before.Value.ToString("yyyy-MM-dd HH:mm:ss")));
             
@@ -2160,10 +2343,11 @@ public class AdminController : ControllerBase
         try
         {
             var dbPath = GetSerilogDbPath();
+            var tableName = GetSerilogTableName();
             using var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;");
             await connection.OpenAsync();
 
-            using (var cmd = new System.Data.SQLite.SQLiteCommand("DELETE FROM orch_logs", connection))
+            using (var cmd = new System.Data.SQLite.SQLiteCommand($"DELETE FROM [{tableName}]", connection))
             {
                 await cmd.ExecuteNonQueryAsync();
             }

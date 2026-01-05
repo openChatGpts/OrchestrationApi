@@ -115,6 +115,12 @@ public class LogCleanupService : BackgroundService
         }
     }
 
+    private string GetSerilogTableName()
+    {
+        var tableName = _configuration.GetValue<string>("Serilog:WriteTo:2:Args:tableName");
+        return string.IsNullOrEmpty(tableName) ? "Logs" : tableName;
+    }
+
     /// <summary>
     /// 清理 Serilog 系统日志（仅支持 SQLite）
     /// </summary>
@@ -123,24 +129,51 @@ public class LogCleanupService : BackgroundService
         try
         {
             var retentionDays = _configuration.GetValue<int>("OrchestrationApi:RequestLogging:RetentionDays", 30);
-            var connectionString = _configuration.GetValue<string>("OrchestrationApi:Database:ConnectionString");
-
-            if (string.IsNullOrEmpty(connectionString))
+            var dbPath = _configuration.GetValue<string>("Serilog:WriteTo:2:Args:sqliteDbPath");
+            if (string.IsNullOrEmpty(dbPath))
             {
-                _logger.LogWarning("未配置数据库连接字符串，跳过 Serilog 日志清理");
+                var connStr = _configuration.GetValue<string>("OrchestrationApi:Database:ConnectionString");
+                if (!string.IsNullOrEmpty(connStr))
+                {
+                    var parts = connStr.Split(';');
+                    var dataSourcePart = parts.FirstOrDefault(p => p.Trim().StartsWith("Data Source=", StringComparison.OrdinalIgnoreCase));
+                    if (dataSourcePart != null)
+                    {
+                        dbPath = dataSourcePart.Split('=')[1].Trim();
+                    }
+                }
+            }
+
+            if (string.IsNullOrEmpty(dbPath))
+            {
+                _logger.LogWarning("未配置Serilog数据库路径，跳过 Serilog 日志清理");
                 return;
             }
 
+            var tableName = GetSerilogTableName();
             var cutoffDate = DateTime.UtcNow.AddDays(-retentionDays);
 
-            using var connection = new Microsoft.Data.Sqlite.SqliteConnection(connectionString);
+            using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}");
             await connection.OpenAsync();
+
+            // 检查表是否存在
+            using (var checkCmd = connection.CreateCommand())
+            {
+                checkCmd.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=@TableName";
+                checkCmd.Parameters.AddWithValue("@TableName", tableName);
+                var exists = Convert.ToInt32(await checkCmd.ExecuteScalarAsync()) > 0;
+                if (!exists)
+                {
+                    _logger.LogDebug("Serilog日志表 '{TableName}' 不存在，跳过清理", tableName);
+                    return;
+                }
+            }
 
             // 删除过期日志
             int deletedCount;
             using (var command = connection.CreateCommand())
             {
-                command.CommandText = "DELETE FROM orch_logs WHERE Timestamp < @cutoffDate";
+                command.CommandText = $"DELETE FROM [{tableName}] WHERE Timestamp < @cutoffDate";
                 command.Parameters.AddWithValue("@cutoffDate", cutoffDate);
                 deletedCount = await command.ExecuteNonQueryAsync();
             }
